@@ -1,0 +1,326 @@
+---
+title: "Random Forest sur des données d'assurance"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+# 1. Objectif
+
+On illustre la méthode **Random Forest** (forest aléatoire) appliquée à un problème
+de **régression** sur des données d'assurance médicale. Nous :
+
+1. construisons une forêt sur la variable cible `PremiumPrice` ;
+2. explorons les attributs de l'objet `randomForest` ;
+3. faisons du **tuning** des hyperparamètres `mtry` et `maxnodes` ;
+4. comparons RF, CART et GLM via une validation croisée 10-plis.
+
+# 2. Librairies et chargement des données
+
+```{r libraries}
+library(rpart)
+library(randomForest)
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+```
+
+Les données `Medicalpremium.csv` sont séparées par `;` et contiennent la prime
+`PremiumPrice` (colonne 11) ainsi que les facteurs de risque.
+
+```{r data}
+db <- read_delim("Medicalpremium.csv", 
+                             delim = ";", escape_double = FALSE, trim_ws = TRUE)
+head(db)
+str(db)
+```
+
+La variable cible est `PremiumPrice` ; les prédicteurs sont les `ncol(db) - 1` colonnes restantes.
+
+# 3. Première forêt aléatoire
+
+## 3.1. Construction
+
+Nous construisons une forêt de `ntree = 500` arbres. Le paramètre `mtry` est fixé à
+$\sqrt{p-1}$ (règle usuelle pour la régression), et `nodesize = 1` autorise des
+feuilles d'une seule observation (arbres pleinement croissés).
+
+```{r rf_build}
+rf <- randomForest(data = db,
+                   PremiumPrice ~ .,
+                   ntree  = 500,
+                   mtry   = sqrt(ncol(db) - 1),
+                   nodesize = 1,
+                   maxnodes = NULL)
+```
+
+## 3.2. Attributs de l'objet `randomForest`
+
+| Attribut | Signification |
+|---|---|
+| `rf$predicted` | Valeurs prédites par la forêt pour chaque individu |
+| `rf$mse` | Erreur quadratique **OOB** (out-of-bag) par nombre d'arbres |
+| `rf$oob.times` | Nombre de fois où chaque observation est OOB sur l'ensemble des arbres |
+| `rf$importance` | Importance des variables (décroissance d'hétérogénéité) |
+| `rf$forest$ndbigtree` | Nombre de nœuds par arbre |
+
+On vérifie la propriété théorique du bootstrap : une observation n'est tirée que
+avec probabilité $1 - 1/n$ à chaque tirage, donc elle est OOB environ
+$e^{-1} \times \text{ntree}$ fois.
+
+```{r oob}
+mean(rf$oob.times)
+exp(-1) * 500   # valeur théorique
+```
+
+## 3.3. Erreur OOB en fonction du nombre d'arbres
+
+```{r oob_plot, fig.cap="Erreur OOB en fonction du nombre d'arbres."}
+oob_df <- data.frame(
+  ntree = seq_along(rf$mse),
+  mse   = rf$mse
+)
+
+ggplot(oob_df, aes(x = ntree, y = mse)) +
+  geom_line(color = "steelblue", linewidth = 0.9) +
+  geom_smooth(method = "loess", se = TRUE,
+              color = "darkred", linewidth = 0.6) +
+  labs(title = "Erreur OOB vs nombre d'arbres",
+       x = "Nombre d'arbres",
+       y = "MSE OOB") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+La courbe décroît puis se stabilise : au-delà d'environ 200–300 arbres,
+ajouter des arbres n'améliore plus l'erreur OOB.
+
+## 3.4. Importance des variables
+
+```{r importance, fig.cap="Importance des variables de risque."}
+imp_df <- data.frame(
+  Variable   = rownames(rf$importance),
+  Importance = rf$importance[, 1]
+) %>%
+  arrange(desc(Importance)) %>%
+  mutate(Variable = factor(Variable, levels = Variable))
+
+ggplot(imp_df, aes(x = Importance, y = Variable)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Importance des variables (Random Forest)",
+       x = "Importance (décroissance d'hétérogénéité)",
+       y = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.y = element_text(size = 9))
+
+```
+
+# 4. Tuning des hyperparamètres
+
+## 4.1. Effet de `mtry`
+
+On fait varier le nombre de variables tirées à chaque nœud (`mtry`) et on mesure
+l'erreur OOB finale.
+
+```{r mtry, fig.cap="Erreur OOB en fonction de mtry."}
+errorVar <- sapply(1:(ncol(db) - 1), function(ii) {
+  tail(randomForest(data = db, PremiumPrice ~ .,
+                    maxnodes = NULL, mtry = ii, ntree = 500)$mse, 1)
+})
+
+mtry_df <- data.frame(
+  mtry = 1:(ncol(db) - 1),
+  mse  = errorVar
+)
+
+ggplot(mtry_df, aes(x = mtry, y = mse)) +
+  geom_line(color = "steelblue", linewidth = 0.9) +
+  geom_point(color = "darkred", size = 2) +
+  labs(title = "Erreur OOB vs mtry",
+       x = "mtry (nombre de variables par nœud)",
+       y = "MSE OOB") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+> **Lecture** : l'erreur est minimale autour de `mtry = 6` ; au-delà, les arbres
+> se corrélatent trop et la variance augmente.
+
+## 4.2. Effet de la profondeur (`maxnodes`)
+
+On fixe `mtry = 6` et on varie le nombre maximal de nœuds par arbre.
+Chaque configuration est évaluée 5 fois pour lisser le bruit.
+
+```{r maxnodes, fig.cap="Erreur OOB en fonction de maxnodes (mtry = 6)."}
+errorNod <- sapply((1:7) * 100, function(ii) {
+  errs <- replicate(5, {
+    tail(randomForest(data = db, PremiumPrice ~ .,
+                      maxnodes = ii, mtry = 6, ntree = 500)$mse, 1)
+  })
+  mean(errs)
+})
+
+nodes_df <- data.frame(
+  maxnodes = (1:7) * 100,
+  mse      = errorNod
+)
+
+ggplot(nodes_df, aes(x = maxnodes, y = mse)) +
+  geom_line(color = "steelblue", linewidth = 0.9) +
+  geom_point(color = "darkred", size = 2) +
+  labs(title = "Erreur OOB vs maxnodes (mtry = 6)",
+       x = "maxnodes (profondeur max des arbres)",
+       y = "MSE OOB moyen (5 réplications)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+> **Lecture** : peu de changement au-delà de 300 nœuds ; les arbres sont
+> suffisamment profonds pour capturer la structure.
+
+## 4.3. Grille conjointe `mtry` × `maxnodes`
+
+On explore une grille de valeurs et on trace la carte de chaleur des erreurs.
+
+```{r grid, fig.cap="Heatmap de l'erreur OOB sur la grille mtry × maxnodes."}
+params <- expand.grid(nbVar  = 3:8,
+                      nbNode = (2:8) * 100)
+
+t1 <- Sys.time()
+params$error <- sapply(1:nrow(params), function(ii) {
+  errs <- replicate(5, {
+    tail(randomForest(data = db, PremiumPrice ~ .,
+                      maxnodes = params$nbNode[ii],
+                      mtry     = params$nbVar[ii],
+                      ntree    = 500)$mse, 1)
+  })
+  mean(errs)
+})
+t2 <- Sys.time()
+cat("Temps d'exécution de la grille :", as.numeric(t2 - t1, units = "mins"), "min\n")
+
+ggplot(params, aes(x = nbVar, y = nbNode, fill = error)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(name = "MSE OOB") +
+  labs(title = "Erreur OOB – grille mtry × maxnodes",
+       x = "mtry",
+       y = "maxnodes") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Variante parallèle (facultative)
+
+```{r parallel, eval=FALSE}
+library(parallel)
+cl <- makeCluster(7)
+clusterExport(cl, varlist = c("db", "params", "randomForest", "replicate"))
+params$error <- parSapply(cl, 1:nrow(params), function(ii) {
+  errs <- replicate(5, {
+    tail(randomForest(data = db, PremiumPrice ~ .,
+                      maxnodes = params$nbNode[ii],
+                      mtry     = params$nbVar[ii],
+                      ntree    = 500)$mse, 1)
+  })
+  mean(errs)
+})
+stopCluster(cl)
+closeAllConnections()
+```
+
+# 5. Comparaison RF vs CART vs GLM
+
+## 5.1. Validation croisée 10-plis
+
+Pour chaque pli, on entraîne les trois modèles sur 90 % des données et on évalue
+l'erreur **RMSE** sur les 10 % restants.
+
+```{r cv, fig.cap="Boxplot des erreurs de prédiction (RMSE) par modèle."}
+set.seed(1234)
+nbFolds <- 10
+folds <- createFolds(y = db$PremiumPrice, k = nbFolds)
+
+db_clean <- na.omit(db)
+
+cat("Nombre de plis créés :", length(folds), "\n")
+
+error <- lapply(1:nbFolds, function(kk) {
+  idx  <- which(1:nrow(db_clean) %in% folds[[kk]])
+  test <- db_clean[idx, ]
+  train <- db_clean[-idx, ]
+
+  rf  <- randomForest(data = train, PremiumPrice ~ .,
+                      maxnodes = 500, mtry = 6, ntree = 500)
+  cart <- rpart(PremiumPrice ~ ., method = "anova", data = train,
+                control = rpart.control(minsplit = 1, minbucket = 1,
+                                        cp = 0, xval = 5))
+  cp   <- cart$cptable[which.min(cart$cptable[, 4]), 1]
+  cart <- prune(cart, cp = cp)
+  reg  <- lm(PremiumPrice ~ ., data = train)
+
+  c(RF   = sqrt(sum((predict(rf,   newdata = test) - test$PremiumPrice)^2)),
+    CART = sqrt(sum((predict(cart, newdata = test) - test$PremiumPrice)^2)),
+    GLM  = sqrt(sum((predict(reg,  newdata = test) - test$PremiumPrice)^2)))
+})
+
+error <- as.data.frame(do.call("rbind", error))
+error_long <- pivot_longer(error, cols = everything(),
+                           names_to = "Model", values_to = "RMSE")
+
+ggplot(error_long, aes(x = Model, y = RMSE, fill = Model)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Erreur de prédiction (RMSE) par modèle – 10 plis",
+       x = NULL, y = "RMSE") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none")
+```
+
+## 5.2. Gains de RF par rapport à CART
+
+```{r gains, fig.cap="Gain moyen de RF par rapport à CART."}
+gain_mean <- (mean(error$CART) - mean(error$RF)) / mean(error$CART) * 100
+gain_sd   <- (sd(error$CART)   - sd(error$RF))   / sd(error$CART)   * 100
+
+cat("Gain moyen en erreur :", round(gain_mean, 1), "%\n")
+cat("Gain en robustesse (écart-type) :", round(gain_sd, 1), "%\n")
+
+gains_df <- data.frame(
+  Metric = c("Erreur moyenne", "Écart-type (robustesse)"),
+  Gain_pct = c(gain_mean, gain_sd)
+)
+
+ggplot(gains_df, aes(x = Metric, y = Gain_pct, fill = Gain_pct > 0)) +
+  geom_col(color = "white") +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "firebrick")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = paste0(round(Gain_pct, 1), "%")),
+            vjust = -0.5, size = 4) +
+  labs(title = "Gain de RF vs CART",
+       x = NULL, y = "Gain en %") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none")
+```
+
+# 6. Synthèse
+
+- **OOB** : la propriété $e^{-1} \times n_{trees}$ est vérifiée empiriquement.
+- **Tuning** : `mtry ≈ 6` et `maxnodes ≈ 300–500` minimisent l'erreur ; au-delà,
+  les gains sont marginaux.
+- **Comparaison** : RF domine CART et GLM à la fois en erreur moyenne et en
+  robustesse, confirmant l'intérêt du bagging pour ce type de données.
